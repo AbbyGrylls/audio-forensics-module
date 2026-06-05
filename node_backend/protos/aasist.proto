@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package audio;
+
+service AntiSpoofService {
+  rpc StreamAudio (stream AudioChunk) returns (stream InferenceResult) {}
+}
+
+message AudioChunk {
+  string session_id = 1;
+  bytes raw_audio_data = 2; 
+}
+
+message InferenceResult {
+  string session_id = 1;
+  float spoof_probability = 2;
+  bool is_authentic = 3;
+}
