@@ -16,9 +16,10 @@ const gRpcStream = client.StreamAudio();
 gRpcStream.on('error', (err) => {
     console.error('gRPC Client Stream Error:', err);
 });
-function sendAudioToPython(sessionId, combinedBuffer) {
+function sendAudioToPython(sessionId,correlationId, combinedBuffer) {
     gRpcStream.write({
         session_id: sessionId,
+        correlation_id: correlationId,
         raw_audio_data: combinedBuffer
     });
 }

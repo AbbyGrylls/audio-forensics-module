@@ -1,0 +1,544 @@
+# AASIST-L Voice Spoof Detection Module — Technical Rulebook and Architecture Guide
+
+**Keywords:** voice spoof detection, AASIST-L, audio forensics, anti-spoofing, deepfake voice detection, real-time audio streaming, gRPC, WebSocket, Node.js, Python ONNX, Redis, MongoDB, session management, RAG knowledge base, compliance dashboard, AI copilot, LangChain, Ollama, vector store, JWT authentication, aggregated risk scoring, spoof probability, bonafide detection
+
+---
+
+## 1. System Overview & Core Purpose
+
+**Keywords:** module objective, system architecture, actors, scope, session lifecycle, service boundary
+
+### 1.1 Objective
+
+The AASIST-L Voice Spoof Detection Module solves the problem of synthetic, cloned, or morphed speech entering telephony systems in real time. The module ingests raw audio from a live caller, streams it to a Python machine-learning worker for inference using the AASIST-L ONNX model, evaluates each audio chunk against configurable risk thresholds, persists structured audit records to MongoDB, and exposes both a compliance dashboard API and an AI-powered Copilot assistant for operator queries.
+
+### 1.2 Scope
+
+**In scope:**
+- Real-time audio ingestion via WebSocket from telephony systems.
+- Per-chunk spoof probability inference via the AASIST-L ONNX model over gRPC.
+- Session-level risk aggregation and verdict determination (BONAFIDE, SUSPICIOUS, SPOOF).
+- Audit log persistence to Redis and MongoDB.
+- Compliance dashboard REST API for reviewing session summaries.
+- A local RAG-powered AI Copilot that answers operator questions about module behavior.
+
+**Explicitly out of scope:**
+- Speaker identification or diarization.
+- Audio transcription or speech-to-text conversion.
+- Caller authentication or access control beyond JWT session validation.
+- Training or fine-tuning the AASIST-L model.
+- Direct integration with telephony hardware or SIP/VoIP signaling.
+
+### 1.3 Primary Actors and Triggers
+
+| Actor | Role | Entry Point |
+|---|---|---|
+| Telephony System (Caller) | Streams raw audio in real time | WebSocket `/ws/audio` with JWT token |
+| Agent Dashboard | Monitors live session telemetry | WebSocket `/ws/agent` with `sessionId` |
+| Compliance Operator | Queries audit records and statistics | REST `GET /api/compliance/dashboard` |
+| Operator / AI User | Asks questions about system behavior | REST `POST /api/copilot/ask` |
+| Bridge Worker (`worker.js`) | Aggregates session chunks into a final verdict | Redis queue `queue:sessions_to_aggregate` |
+| Python ML Worker (`worker.py`) | Runs AASIST-L ONNX inference | gRPC `StreamAudio` on port `50051` |
+
+---
+
+## 2. Input Specifications and Validation Rules
+
+**Keywords:** WebSocket input, JWT token, audio chunk, gRPC payload, REST API input, validation, authentication, session creation, binary audio
+
+### 2.1 Caller WebSocket Input (`/ws/audio`)
+
+- **Protocol:** WebSocket over HTTP upgrade.
+- **Authentication:** IF a `token` query parameter is absent from the WebSocket upgrade URL, THEN the Node.js Gateway Server rejects the connection with `HTTP 401 Unauthorized`.
+- **Token Format:** The `token` must be a valid JSON Web Token signed with `JWT_SECRET` (loaded from environment variable). IF `jwt.verify()` throws any error (expired, malformed, wrong secret), THEN the Node.js Gateway Server rejects the connection with `HTTP 403 Forbidden`.
+- **Session ID:** The `sessionId` field is extracted from the decoded JWT payload. IF `sessionId` is absent from the token, THEN the Node.js Session Manager generates a random 16-byte hex string as the session ID.
+- **Payload format:** Each WebSocket message from the Caller is a raw binary `Buffer` representing 16-bit signed PCM audio samples.
+- **Maximum payload size:** The WebSocket Server enforces a `maxPayload` of `64 * 1024` bytes (64 KB) per message. IF a single message exceeds 64 KB, THEN the WebSocket library rejects the message automatically.
+- **Concurrency limit:** IF `liveSessions.size >= 500` (MAX_CONCURRENT_SESSIONS) at the time of an upgrade request, THEN the Node.js Gateway Server rejects the connection with `HTTP 503 Service Unavailable`.
+
+### 2.2 Agent WebSocket Input (`/ws/agent`)
+
+- **Protocol:** WebSocket over HTTP upgrade.
+- **Authentication:** No JWT token is required for agent connections.
+- **Required parameter:** The `sessionId` query parameter must be present. IF `sessionId` is absent, THEN the Node.js Gateway Server rejects the connection with `HTTP 400 Bad Request`.
+- **Behavior:** The Agent Handler polls `liveSessions` after a 500ms delay. IF the requested `sessionId` is not found in `liveSessions`, THEN the Agent Handler sends `{ status: 'ERROR', message: 'Session not found.' }` and closes the WebSocket connection.
+
+### 2.3 Audio Chunk Accumulation Rules
+
+- **Chunk threshold (CHUNK_THRESHOLD):** `20` audio chunks must accumulate in `session.audioBuffer` before any gRPC inference call is triggered.
+- **Buffer overflow protection:** IF `session.audioBuffer.length > 100` (MAX_BUFFER_CHUNKS), THEN the Node.js Handler truncates the buffer by keeping only the last 100 chunks and logs a `[DOS-PROTECTION]` warning.
+- **Backpressure rule:** IF `session.inFlightGrpcRequests >= 1` (MAX_IN_FLIGHT_GRPC) when CHUNK_THRESHOLD is reached, THEN the Node.js Handler discards the oldest `STRIDE_CHUNKS` (10) chunks from the buffer and skips the gRPC call, logging a `[BACKPRESSURE]` warning.
+
+### 2.4 gRPC Input to Python ML Worker
+
+- **Service definition:** `AntiSpoofService.StreamAudio` defined in `aasist.proto` (package `audio`).
+- **Message type:** `AudioChunk` with fields:
+  - `session_id` (string): The active session identifier.
+  - `raw_audio_data` (bytes): Concatenated binary PCM audio from the 20-chunk window.
+  - `correlation_id` (string): A unique identifier in the format `corr_<16-byte-hex>` generated by the Node.js Handler.
+- **Target samples:** The Python ML Worker normalizes all audio to exactly `64,600` samples (approximately 4 seconds at 16kHz). IF the input is longer, THEN the Python ML Worker truncates to 64,600 samples. IF the input is shorter, THEN the Python ML Worker tiles (repeats) the audio until it reaches 64,600 samples.
+- **Odd-byte protection:** IF `len(audio_bytes) % 2 != 0`, THEN the Python ML Worker strips the final byte before `int16` conversion.
+- **Empty buffer protection:** IF the audio buffer produces zero samples after conversion, THEN the Python ML Worker skips inference and logs a warning without yielding a result.
+
+### 2.5 REST API: Compliance Dashboard Input (`GET /api/compliance/dashboard`)
+
+- **Query parameter:** `range` (string). Accepted values: `1h` (last 1 hour), `24h` (last 24 hours), `7d` (last 7 days), `1m` (last 1 month).
+- **Default behavior:** IF `range` is absent or unrecognized, THEN the Compliance Routes handler sets `startTime` to `new Date(0)` (Unix epoch), effectively returning all sessions.
+- **No authentication is required** by the Compliance Routes handler (authentication must be applied at the infrastructure/reverse-proxy layer).
+
+### 2.6 REST API: AI Copilot Input (`POST /api/copilot/ask`)
+
+- **Request body:** JSON object with a `question` field (string).
+- **Validation:** IF `question` is absent OR is not of type `string`, THEN the Copilot Routes handler returns `HTTP 400` with `{ error: 'A valid question string is required in the request body.' }`.
+- **Dependency check:** IF the Vector Store (in-memory embedding store) was not initialized before the request, THEN the Copilot Service throws `"Knowledge base not initialized"` and the Copilot Routes handler returns `HTTP 500`.
+
+---
+
+## 3. Core Processing Logic & Step-by-Step Workflow
+
+**Keywords:** audio pipeline, chunk processing, gRPC streaming, ONNX inference, softmax, spoof probability, Redis persistence, aggregation worker, verdict computation, session lifecycle, dead letter queue
+
+### 3.1 Server Startup Sequence
+
+1. The Node.js Gateway Server calls `initVectorStore()` from the Copilot Service.
+2. The Copilot Service generates embeddings for all 9 entries in `SYSTEM_KNOWLEDGE` using the local Ollama `nomic-embed-text` model and loads them into a `MemoryVectorStore`.
+3. IF `initVectorStore()` fails, THEN the Node.js Gateway Server calls `process.exit(1)` and does not begin accepting connections.
+4. IF `initVectorStore()` succeeds, THEN the Node.js Gateway Server starts listening on the configured `PORT` (default: `3000`).
+5. The MongoDB connection is established using `MONGO_URI` from the environment. Connection failures are logged but do not prevent server startup (REST API calls requiring MongoDB will fail at query time).
+
+### 3.2 Caller Session Lifecycle
+
+**Step 1 — WebSocket Upgrade and Authentication**
+- The Node.js Gateway Server intercepts the HTTP upgrade request in the `upgrade` event handler of `initAudioSocket`.
+- The Node.js Gateway Server validates the JWT token and extracts or generates the `sessionId`.
+- The Node.js Session Manager creates a new session entry in `liveSessions` (a `Map`) with the following initial state: `audioBuffer: []`, `agentSocket: null`, `lastActivity: Date.now()`, `modelTrackingVersion: 'AASIST-L_v1.0.0'`, `hasReachedThreshold: false`, `inFlightGrpcRequests: 0`.
+- The Node.js Handler sends `{ event: 'SESSION_CREATED', sessionId, message: 'Audio stream ready.' }` to the caller.
+
+**Step 2 — Audio Chunk Buffering**
+- Each binary WebSocket message from the caller is pushed as a raw `Buffer` into `session.audioBuffer`.
+- The Node.js Handler updates `session.lastActivity` on every message.
+- Buffer overflow and backpressure rules (Section 2.3) are evaluated after each push.
+
+**Step 3 — gRPC Inference Dispatch**
+- IF `session.audioBuffer.length >= 20` AND `session.inFlightGrpcRequests < 1`, THEN:
+  - The Node.js Handler concatenates the first 20 chunks into a single `Buffer` using `Buffer.concat()`.
+  - A unique `correlationId` is generated: `corr_<16-byte-hex>`.
+  - `session.inFlightGrpcRequests` is incremented by 1.
+  - `sendAudioToPython(sessionId, correlationId, audioToSend)` is called, writing to the persistent bidirectional gRPC stream.
+  - The buffer is slid forward by `STRIDE_CHUNKS` (10): `session.audioBuffer = session.audioBuffer.slice(10)`.
+
+**Step 4 — Python ML Worker Inference**
+- The Python ML Worker receives the `AudioChunk` from the gRPC stream.
+- The Python ML Worker preprocesses audio to 64,600 float32 samples normalized from int16 (`/ 32768.0`).
+- The Python ML Worker runs the AASIST-L ONNX model: `ort_session.run(None, {input_name: input_tensor})`.
+- The Python ML Worker searches model outputs for a tensor with shape `(1, 2)` representing `[spoof_logit, authentic_logit]`.
+- The Python ML Worker applies softmax: `probabilities = exp(logits) / sum(exp(logits))`.
+- `spoof_probability = float(probabilities[0][0])` (the first class is always Spoof).
+- `is_authentic = spoof_probability < 0.5`.
+- The Python ML Worker yields an `InferenceResult` with `session_id`, `correlation_id`, `spoof_probability` (float 0.0–1.0), and `is_authentic` (bool).
+- IF an exception occurs during inference, THEN the Python ML Worker yields `InferenceResult` with `spoof_probability = 1.0` and `is_authentic = False` (fail-closed / highest-risk fallback).
+
+**Step 5 — gRPC Result Handling in Node.js**
+- The Node.js gRPC client receives `InferenceResult` on the `data` event of `gRpcStream`.
+- `session.inFlightGrpcRequests` is decremented by 1.
+- `safeSpoofProbability` is clamped: `Math.min(1, Math.max(0, parseFloat(spoof_probability) || 0))`.
+- IF `session.agentSocket.readyState === WebSocket.OPEN`, THEN the Node.js Handler sends a real-time telemetry payload to the connected Agent Dashboard WebSocket: `{ correlationId, spoof_probability, status, message }`.
+- The Node.js Handler constructs an `auditChunk` with `spoofProbability` stored as a percentage (0–100): `safeSpoofProbability * 100`.
+- Using `setImmediate`, the Node.js Handler asynchronously pushes the audit chunk to Redis: `RPUSH session:<sessionId>:chunks <JSON>`.
+- The Node.js Handler also sets the model key: `SET session:<sessionId>:model 'AASIST-L_v1.0.0' EX 86400`.
+- IF Redis write fails, THEN the Node.js Handler calls `pushToDLQ()` to enqueue the audit chunk in the in-memory Dead Letter Queue.
+
+**Step 6 — Session Teardown on Caller Disconnect**
+- On WebSocket `close` event:
+  - IF `session.hasReachedThreshold === true` AND `session.audioBuffer.length > 0`, THEN the Node.js Handler sends any remaining buffered audio as a final gRPC call (tail flush).
+  - After 3000ms, the Node.js Handler calls `cleanupSession(sessionId)` to close sockets and remove the session from `liveSessions`.
+  - The Node.js Handler pushes the `sessionId` to the Redis queue: `RPUSH queue:sessions_to_aggregate <sessionId>`.
+  - IF `session.hasReachedThreshold === false` (call shorter than 4 seconds), THEN the session is silently discarded (`cleanupSession`) with no aggregation queued.
+
+### 3.3 Bridge Worker Aggregation Sequence (`worker.js`)
+
+**Step 1 — Queue Listening**
+- The Bridge Worker blocks on `BRPOP queue:sessions_to_aggregate 0` (infinite timeout).
+- When a `sessionId` is dequeued, the Bridge Worker calls `aggregateAndSave(redis, sessionId)`.
+
+**Step 2 — Data Retrieval**
+- The Bridge Worker fetches all audit chunks: `LRANGE session:<sessionId>:chunks 0 -1`.
+- The Bridge Worker fetches the model version: `GET session:<sessionId>:model` (defaults to `'UNKNOWN'` if absent).
+- IF no chunks are found, THEN the Bridge Worker logs a discard notice and deletes the Redis keys.
+
+**Step 3 — Verdict Computation (`computeAggregatedStatus`)**
+- `peakSpoofProbability = Math.max(...timeline.map(c => c.spoofProbability))` (already in 0–100 range).
+- `aggregatedRisk = sum(spoofProbability) / count` (simple mean over all chunks).
+- **Consecutive chunk check:** The Bridge Worker iterates the timeline counting consecutive chunks where `spoofProbability >= 65`. It tracks the maximum consecutive run (`maxConsecutive`).
+- **Verdict Rule 1 — SPOOF (highest priority):** IF `maxConsecutive >= 2` OR `peakSpoofProbability >= 85`, THEN `finalVerdict = 'SPOOF'`.
+- **Verdict Rule 2 — SUSPICIOUS:** IF SPOOF condition is not met AND (`peakSpoofProbability >= 50` OR (`aggregatedRisk >= 30` AND `aggregatedRisk <= 60`)), THEN `finalVerdict = 'SUSPICIOUS'`.
+- **Verdict Rule 3 — BONAFIDE:** IF neither SPOOF nor SUSPICIOUS conditions are met, THEN `finalVerdict = 'BONAFIDE'`.
+
+**Step 4 — MongoDB Persistence**
+- The Bridge Worker calls `SessionSummary.create(...)` with the following fields:
+  - `sessionId` (string, unique index)
+  - `modelVersion` (string, e.g., `'AASIST-L_v1.0.0'`)
+  - `startTime` (Date, from `timeline[0].timestamp`)
+  - `endTime` (Date, from `timeline[timeline.length - 1].timestamp`)
+  - `peakSpoofProbability` (Number, rounded to 1 decimal)
+  - `aggregatedRisk` (Number, rounded to 1 decimal)
+  - `finalVerdict` (String enum: `'BONAFIDE'`, `'SUSPICIOUS'`, `'SPOOF'`)
+  - `timeline` (Array of `EvaluationChunk` objects: `{ correlationId, spoofProbability, status, timestamp }`)
+
+**Step 5 — Redis Cleanup**
+- The Bridge Worker deletes both `session:<sessionId>:chunks` and `session:<sessionId>:model` from Redis.
+
+### 3.4 Dead Letter Queue Retry Worker (in `sessionManager.js`)
+
+- The DLQ retry worker runs every 10,000ms (10 seconds) in a `setInterval`.
+- IF `deadLetterQueue.length === 0`, THEN the DLQ retry worker exits immediately.
+- IF `deadLetterQueue.length > 0`, THEN the DLQ retry worker copies the queue, clears it, and attempts to re-push each payload to the Redis key `telephony-audit-logs` using `RPUSH`.
+- IF a re-push to Redis fails again, THEN the failed payload is returned to the Dead Letter Queue via `pushToDLQ()`.
+- IF `deadLetterQueue.length >= 5000` (MAX_DLQ_SIZE) when `pushToDLQ()` is called, THEN the payload is permanently lost and a `[CRITICAL FATAL] DLQ Overflow!` error is logged.
+
+### 3.5 Session Staleness Eviction (in `sessionManager.js`)
+
+- A `setInterval` runs every 60,000ms (1 minute) and iterates all entries in `liveSessions`.
+- IF `Date.now() - session.lastActivity > 1,800,000ms` (SESSION_TTL_MS = 30 minutes), THEN the Node.js Session Manager calls `cleanupSession(sessionId)` and logs a `[DOS-PROTECTION] Evicting stale session` warning.
+
+### 3.6 AI Copilot RAG Pipeline (`copilotService.js`)
+
+**Step 1 — Question Intake**
+- The Copilot Routes handler receives the `question` string via `POST /api/copilot/ask`.
+
+**Step 2 — Vector Similarity Search**
+- The Copilot Service calls `vectorStore.similaritySearch(question, 3)` to retrieve the 3 most semantically relevant knowledge entries from `SYSTEM_KNOWLEDGE`.
+
+**Step 3 — Context Assembly**
+- The 3 retrieved document `pageContent` strings are joined with newlines into `contextText`.
+
+**Step 4 — LLM Prompt Construction**
+- The Copilot Service builds a prompt instructing the local `llama3` model via ChatOllama to answer using ONLY the provided `contextText`.
+- The prompt identity: `"You are the AASIST-L Support Copilot, an AI assistant for a voice spoof detection dashboard."`.
+- IF the context does not contain the answer, the model is instructed to respond: `"I don't have enough system data to answer that."`.
+
+**Step 5 — LLM Invocation**
+- The Copilot Service calls `llm.invoke([{ role: 'user', content: prompt }])` with `temperature: 0.1` for deterministic, factual answers.
+- The Copilot Service returns `response.content` to the Copilot Routes handler.
+
+### 3.7 Compliance Dashboard Query (`complianceRoutes.js`)
+
+**Aggregate Statistics Query:**
+- The Compliance Routes handler computes the following using MongoDB aggregation:
+  - `totalSessions`: Count of all sessions in the time range.
+  - `flaggedSessions`: Count of sessions where `finalVerdict` is `'SPOOF'` or `'SUSPICIOUS'`.
+  - `aggRisk`: Average of `aggregatedRisk` across all sessions.
+
+**Recent Sessions List:**
+- The Compliance Routes handler returns the 50 most recent sessions sorted by `startTime` descending.
+- The `timeline` array is excluded from the list payload (`$project: { timeline: 0 }`) to reduce bandwidth.
+- An `eventCount` field is added via `$addFields`: `{ $size: { $ifNull: ["$timeline", []] } }`.
+
+**Single Session Detail:**
+- The Compliance Routes handler retrieves a full `SessionSummary` document including the `timeline` array by `sessionId`.
+
+---
+
+## 4. Output Specifications & Downstream Impact
+
+**Keywords:** WebSocket events, gRPC results, Redis payloads, MongoDB schema, REST API response, agent telemetry, compliance dashboard output, AI copilot response
+
+### 4.1 Real-Time Agent Dashboard WebSocket Output
+
+The Node.js Handler pushes a JSON payload to the Agent Dashboard WebSocket after each inference result:
+
+```json
+{
+  "correlationId": "corr_<32-char-hex>",
+  "spoof_probability": 0.72,
+  "status": "SPOOF",
+  "message": "Potential AI Voice Clone Detected"
+}
+```
+
+- `status` is `"BONAFIDE"` IF `is_authentic === true`; `"SPOOF"` IF `is_authentic === false`.
+- `spoof_probability` is a float in the range `[0.0, 1.0]`.
+- This payload is NOT persisted; it is ephemeral telemetry for live monitoring only.
+
+### 4.2 Redis Audit Chunk Format
+
+Each audit chunk pushed to `session:<sessionId>:chunks` (Redis List, RPUSH) is a JSON string:
+
+```json
+{
+  "correlationId": "corr_<32-char-hex>",
+  "spoofProbability": 72.3,
+  "status": "SPOOF",
+  "timestamp": "2025-01-15T10:23:45.123Z"
+}
+```
+
+- `spoofProbability` is stored as a percentage (0–100), not a float (0–1).
+- `status` is `"BONAFIDE"` or `"SPOOF"` (no `"SUSPICIOUS"` at chunk level; SUSPICIOUS is a session-level verdict only).
+
+### 4.3 MongoDB `SessionSummary` Document Schema
+
+```
+{
+  sessionId:              String  (unique, indexed)
+  modelVersion:           String  (e.g., "AASIST-L_v1.0.0")
+  startTime:              Date
+  endTime:                Date
+  peakSpoofProbability:   Number  (0–100, 1 decimal)
+  aggregatedRisk:         Number  (0–100, 1 decimal)
+  finalVerdict:           Enum    ("BONAFIDE" | "SUSPICIOUS" | "SPOOF")
+  timeline: [{
+    correlationId:        String
+    spoofProbability:     Number  (0–100, 1 decimal)
+    status:               String
+    timestamp:            Date
+  }]
+}
+```
+
+### 4.4 REST API: Compliance Dashboard Response (`GET /api/compliance/dashboard`)
+
+```json
+{
+  "stats": {
+    "totalSessions": 142,
+    "flaggedSessions": 17,
+    "aggRisk": 23.4
+  },
+  "sessions": [
+    {
+      "sessionId": "abc123",
+      "modelVersion": "AASIST-L_v1.0.0",
+      "startTime": "...",
+      "endTime": "...",
+      "peakSpoofProbability": 91.2,
+      "aggregatedRisk": 67.8,
+      "finalVerdict": "SPOOF",
+      "eventCount": 14
+    }
+  ]
+}
+```
+
+- IF no sessions exist in the time range, THEN `stats` is `{ totalSessions: 0, flaggedSessions: 0, aggRisk: 0 }` and `sessions` is `[]`.
+
+### 4.5 REST API: AI Copilot Response (`POST /api/copilot/ask`)
+
+```json
+{
+  "answer": "A session is flagged as DANGER (Spoof) if the Peak Spoof Probability exceeds 85%..."
+}
+```
+
+### 4.6 Downstream Module Consumption
+
+| Output | Consumed By |
+|---|---|
+| Agent WebSocket Payload | Agent Dashboard UI (real-time monitoring) |
+| Redis `session:<id>:chunks` list | Bridge Worker (`worker.js`) aggregation |
+| Redis `queue:sessions_to_aggregate` | Bridge Worker (`worker.js`) queue listener |
+| MongoDB `SessionSummary` documents | Compliance Routes handler (`complianceRoutes.js`) |
+| DLQ entries (in-memory) | DLQ retry worker (in `sessionManager.js`) |
+| AI Copilot answer string | Operator-facing dashboard chat UI |
+
+---
+
+## 5. Troubleshooting, Edge Cases, and Error States
+
+**Keywords:** failure modes, error handling, edge cases, DLQ overflow, gRPC disconnection, Redis failure, MongoDB duplicate, short call discard, ONNX model error, JWT expiry, backpressure, buffer overflow, stale session
+
+### 5.1 Python ML Worker gRPC Stream Disconnection
+
+**Failure Mode:** The `gRpcStream` in `grpcClient.js` emits an `error` event, meaning the connection to the Python ML Worker on `localhost:50051` has failed or been interrupted.
+
+**Impact:** All in-flight and future gRPC writes will fail silently. No new `InferenceResult` events will be received by the Node.js Handler. Sessions will continue to buffer audio and increment `inFlightGrpcRequests`, but results will never return. `inFlightGrpcRequests` will never decrement, permanently triggering the backpressure guard for all active sessions.
+
+**Resolution Path:**
+- The gRPC client in `grpcClient.js` creates a single persistent stream at module load time with no automatic reconnection logic.
+- Operators must restart the Node.js Gateway Server process to re-establish the gRPC stream.
+- A production fix is to implement gRPC stream reconnection with exponential backoff inside `grpcClient.js`.
+
+### 5.2 Redis Connection Failure During Audit Chunk Persistence
+
+**Failure Mode:** The Redis `rPush` call for `session:<sessionId>:chunks` throws an error in the `setImmediate` callback in `handlers.js`.
+
+**Impact:** The audit chunk is NOT persisted to Redis. The chunk is forwarded to the in-memory Dead Letter Queue via `pushToDLQ()`.
+
+**Resolution Path:**
+- The DLQ retry worker (in `sessionManager.js`) retries failed chunks every 10 seconds by pushing to `telephony-audit-logs` in Redis.
+- Note: The DLQ retry worker pushes to a different key (`telephony-audit-logs`) than the original session key (`session:<id>:chunks`). This means retried chunks are NOT included in the Bridge Worker's aggregation for that session. The session verdict will be computed on incomplete data.
+- IF the Dead Letter Queue reaches 5,000 entries, THEN all subsequent push attempts are permanently dropped with a `[CRITICAL FATAL]` log.
+
+### 5.3 MongoDB Duplicate Session ID on Aggregation
+
+**Failure Mode:** The Bridge Worker calls `SessionSummary.create()` but a document with the same `sessionId` already exists (e.g., the `queue:sessions_to_aggregate` received a duplicate push, or a previous aggregation partially succeeded before a crash).
+
+**Impact:** MongoDB throws a duplicate key error on the `sessionId` unique index.
+
+**Resolution Path:**
+- The Bridge Worker catches this error in its `try/catch` block and logs `[WORKER] Failed to aggregate session`.
+- The Redis keys for the session (`session:<id>:chunks` and `session:<id>:model`) are NOT cleaned up when aggregation fails, leaving them in Redis indefinitely.
+- Operators should use `SessionSummary.findOneAndUpdate` with `upsert: true` for idempotent aggregation, or implement a failed-aggregation Dead Letter Queue keyed by `sessionId`.
+
+### 5.4 Short Call Discard (Under 4 Seconds / Below Threshold)
+
+**Failure Mode / Edge Case:** A caller connects, sends fewer than 20 audio chunks (the CHUNK_THRESHOLD), and disconnects.
+
+**Impact:** `session.hasReachedThreshold` remains `false`. On disconnect, the Node.js Handler silently calls `cleanupSession(sessionId)` with NO gRPC inference call and NO aggregation queue push. No `SessionSummary` document is created. The session leaves no audit trail.
+
+**Resolution Path:**
+- This is intentional behavior for very short or accidental connections (e.g., under ~4 seconds of audio at 200ms chunk intervals).
+- Operators who require audit trails for all connections should lower `CHUNK_THRESHOLD` in `config.js` or add a minimum-duration check on disconnect.
+
+### 5.5 ONNX Inference Exception in Python ML Worker
+
+**Failure Mode:** The Python ML Worker raises an exception during audio preprocessing or ONNX model execution (e.g., malformed audio bytes, model file missing, ORT session not initialized).
+
+**Impact:** The Python ML Worker catches the exception and yields an `InferenceResult` with `spoof_probability = 1.0` and `is_authentic = False`.
+
+**Resolution Path:**
+- The Node.js Handler receives this result as a legitimate SPOOF signal. The session will be flagged SPOOF or SUSPICIOUS even though the inference failed.
+- The Python ML Worker logs the error: `[ERROR] Failed processing audio for <session_id> (Corr: <corr_id>): <error>`.
+- Operators monitoring the dashboard should correlate suspiciously high spoof rates with Python ML Worker error logs to identify false positives caused by inference failures.
+
+### 5.6 Vector Store Not Initialized (Copilot Service)
+
+**Failure Mode:** A `POST /api/copilot/ask` request arrives before `initVectorStore()` has completed (race condition during slow Ollama startup), or Ollama is unreachable.
+
+**Impact:** The Copilot Service throws `"Knowledge base not initialized"`. The Copilot Routes handler catches this and returns `HTTP 500`.
+
+**Resolution Path:**
+- The Node.js Gateway Server calls `initVectorStore()` and only starts the HTTP server after it resolves. IF Ollama is unreachable during `initVectorStore()`, `startServer()` catches the error and calls `process.exit(1)`.
+- Operators should ensure the local Ollama instance with `nomic-embed-text` and `llama3` models is running before starting the Node.js Gateway Server.
+
+### 5.7 Stale Session Eviction During Active Call
+
+**Failure Mode / Edge Case:** A session's `lastActivity` timestamp has not been updated for 30 minutes (SESSION_TTL_MS). The Session Manager's eviction interval fires and calls `cleanupSession(sessionId)`.
+
+**Impact:** The caller's WebSocket is forcibly closed. Any buffered audio and in-flight gRPC requests for the session are lost. The session is removed from `liveSessions`. IF the session's data was already partially written to Redis, the Bridge Worker will never be triggered because the session teardown (queue push) does not occur on eviction.
+
+**Resolution Path:**
+- The eviction loop logs a `[DOS-PROTECTION] Evicting stale session` warning.
+- Telephony systems must send audio data more frequently than 30 minutes to keep sessions alive. Silent periods longer than 30 minutes will cause session loss.
+- Operators should consider adding a keep-alive ping mechanism or lowering SESSION_TTL_MS to match expected maximum call duration.
+
+### 5.8 Agent Dashboard Connecting to Already-Closed Session
+
+**Failure Mode / Edge Case:** An Agent Dashboard WebSocket connects to `/ws/agent?sessionId=<id>` after the session has already been cleaned up (caller disconnected and `cleanupSession` was called).
+
+**Impact:** The 500ms lookup timeout in `handleAgent` fires. `liveSessions.get(targetSessionId)` returns `undefined`. The Node.js Handler sends `{ status: 'ERROR', message: 'Session not found.' }` and closes the Agent WebSocket.
+
+**Resolution Path:**
+- The Agent Dashboard UI should handle the `STATUS: ERROR` message and redirect the operator to the Compliance Dashboard's session detail view for historical data.
+
+### 5.9 gRPC Stream Shape Mismatch (Unexpected ONNX Output)
+
+**Failure Mode / Edge Case:** The AASIST-L ONNX model is replaced or updated with a version that produces outputs with shapes other than `(1, 2)`.
+
+**Impact:** The Python ML Worker's loop searching for shape `(1, 2)` in `raw_outputs` finds nothing (`logits = None`). It falls back to using the last element of `raw_outputs` (`logits = raw_outputs[-1]`). IF the last output is not a 2-class logit tensor, softmax and indexing will produce incorrect probabilities or raise an exception.
+
+**Resolution Path:**
+- A new ONNX model must be validated to confirm its output tensor shape is `(1, 2)` where index `[0][0]` is the spoof logit.
+- The Python ML Worker should be updated to explicitly name and reference expected output nodes from the ONNX model metadata rather than searching by shape.
+
+### 5.10 Consecutive Chunk Threshold for SPOOF Verdict (Boundary Condition)
+
+**Failure Mode / Edge Case:** A session has exactly 2 consecutive chunks at `spoofProbability = 65.0` (the boundary value).
+
+**Impact:** The Bridge Worker's consecutive check uses `>= 65`, so `65.0 >= 65` evaluates to `true`. Two consecutive chunks at exactly 65 trigger `maxConsecutive >= 2`, and the session receives a `SPOOF` verdict even though the `peakSpoofProbability` is exactly 65 (below the 85 peak threshold) and `aggregatedRisk` may be below 30.
+
+**Resolution Path:**
+- This is intentional behavior per the defined rules. Operators should be aware that a brief but sustained spike to exactly the 65% boundary is treated as a confirmed spoof event.
+- To adjust sensitivity, modify the `>= 65` boundary and the `>= 2` consecutive count in `worker.js` → `computeAggregatedStatus()`.
+
+---
+
+## 6. Configuration Reference
+
+**Keywords:** environment variables, config constants, Redis, JWT, session limits, buffer thresholds
+
+| Parameter | Source | Value | Description |
+|---|---|---|---|
+| `MONGO_URI` | Environment variable | (required) | MongoDB connection string |
+| `REDIS_URL` | Environment variable | `redis://localhost:6379` (default) | Redis connection URL |
+| `JWT_SECRET` | Environment variable | (required) | Secret for JWT verification |
+| `PORT` | Environment variable | `3000` (default) | HTTP/WebSocket server port |
+| `MAX_CONCURRENT_SESSIONS` | `config.js` | `500` | Maximum simultaneous WebSocket sessions |
+| `SESSION_TTL_MS` | `config.js` | `1,800,000` ms (30 min) | Inactivity timeout for session eviction |
+| `CHUNK_THRESHOLD` | `config.js` | `20` | Audio chunks required before gRPC inference |
+| `STRIDE_CHUNKS` | `config.js` | `10` | Chunks to slide the buffer after each gRPC send |
+| `MAX_BUFFER_CHUNKS` | `config.js` | `100` | Maximum audio chunks held in memory per session |
+| `MAX_IN_FLIGHT_GRPC` | `config.js` | `1` | Maximum concurrent gRPC requests per session |
+| `MAX_DLQ_SIZE` | `config.js` | `5000` | Maximum in-memory Dead Letter Queue entries |
+| `SPOOF_PEAK_THRESHOLD` | `worker.js` (hardcoded) | `85` | Peak probability (%) triggering SPOOF verdict |
+| `SPOOF_CONSECUTIVE_THRESHOLD` | `worker.js` (hardcoded) | `65` | Per-chunk probability (%) for consecutive check |
+| `SPOOF_CONSECUTIVE_COUNT` | `worker.js` (hardcoded) | `2` | Minimum consecutive chunks to trigger SPOOF |
+| `SUSPICIOUS_PEAK_MIN` | `worker.js` (hardcoded) | `50` | Minimum peak probability (%) for SUSPICIOUS |
+| `SUSPICIOUS_AGG_MIN` | `worker.js` (hardcoded) | `30` | Minimum aggregated risk (%) for SUSPICIOUS |
+| `SUSPICIOUS_AGG_MAX` | `worker.js` (hardcoded) | `60` | Maximum aggregated risk (%) for SUSPICIOUS |
+| `PYTHON_GRPC_PORT` | `grpcClient.js` (hardcoded) | `50051` | gRPC server port of Python ML Worker |
+| `TARGET_SAMPLES` | `worker.py` (hardcoded) | `64,600` | Target audio sample count for ONNX inference |
+| `EMBEDDING_MODEL` | `copilotService.js` (hardcoded) | `nomic-embed-text` | Ollama model for vector embeddings |
+| `LLM_MODEL` | `copilotService.js` (hardcoded) | `llama3` | Ollama model for RAG question answering |
+| `LLM_TEMPERATURE` | `copilotService.js` (hardcoded) | `0.1` | LLM temperature for deterministic answers |
+| `RAG_TOP_K` | `copilotService.js` (hardcoded) | `3` | Number of knowledge chunks retrieved per query |
+
+---
+
+## 7. Component Dependency Map
+
+**Keywords:** module dependencies, inter-service communication, data flow, service graph
+
+```
+Telephony System (Caller)
+        │ WebSocket /ws/audio (JWT)
+        ▼
+Node.js Gateway Server (server.js)
+        │ initAudioSocket.js → handlers.js
+        │
+        ├──► Python ML Worker (worker.py) [gRPC port 50051]
+        │         │ ONNX: aasist_l.onnx
+        │         │ Proto: aasist.proto
+        │         └──► InferenceResult ──► handlers.js (gRpcStream 'data' event)
+        │
+        ├──► Redis
+        │     ├── RPUSH session:<id>:chunks  (audit chunks)
+        │     ├── SET   session:<id>:model   (model version)
+        │     └── RPUSH queue:sessions_to_aggregate (trigger)
+        │
+        └──► Agent Dashboard WebSocket /ws/agent
+                  (real-time telemetry per session)
+
+Redis queue:sessions_to_aggregate
+        │ BRPOP
+        ▼
+Bridge Worker (worker.js)
+        ├── LRANGE session:<id>:chunks → computeAggregatedStatus()
+        └── SessionSummary.create() ──► MongoDB
+
+REST API (Express)
+        ├── GET  /api/compliance/dashboard  ──► MongoDB SessionSummary
+        ├── GET  /api/compliance/sessions/:id ──► MongoDB SessionSummary
+        └── POST /api/copilot/ask
+                  └── copilotService.js
+                        ├── MemoryVectorStore (SYSTEM_KNOWLEDGE embeddings)
+                        └── ChatOllama llama3 (local LLM)
+```
+
+---
+
+## 8. AASIST-L Copilot Knowledge Base (SYSTEM_KNOWLEDGE)
+
+**Keywords:** copilot rules, knowledge base, embedded facts, vector store content, RAG source documents
+
+The following 9 facts are embedded into the in-memory `MemoryVectorStore` at server startup. These are the exclusive source of truth for the AI Copilot's answers:
+
+1. The AASIST-L Voice Spoof Detection Module uses the `AASIST-L_v1.0.0` machine learning model to detect synthetic, cloned, or morphed speech.
+2. The AASIST-L Voice Spoof Detection Module processes audio continuously in 200ms chunks to ensure near real-time detection.
+3. Aggregated Risk is a weighted score calculated over the entire duration of the session.
+4. A session is immediately flagged as DANGER (Spoof) if the Peak Spoof Probability exceeds 85%.
+5. A session is flagged as DANGER if there are 2 or more consecutive audio chunks with a spoof score over 65%.
+6. A session is flagged as SUSPICIOUS if the Peak score is above 50% or the Aggregated Risk is between 30% and 60%.
+7. The AASIST-L Voice Spoof Detection Module backend is built on Node.js using an Express API and WebSocket connections for real-time audio streaming.
+8. The compliance dashboard displays Peak Probability, Aggregated Risk, and the total number of audio events analyzed.
+9. The `timeline` array is stripped from the dashboard feed to save bandwidth and is only requested when opening the Session Audit Modal.
